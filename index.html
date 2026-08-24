@@ -238,6 +238,19 @@ select{
 .brush-info .chip{width:16px;height:16px;border-radius:50%;border:1px solid rgba(0,0,0,.2);display:inline-block}
 .edit-hint{color:var(--muted);font-size:12px}
 
+.import-bar{
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:8px 14px;border-bottom:1px solid var(--line);
+  background:var(--surface-2);font-size:13px;
+}
+.import-bar[hidden]{display:none}
+.import-ctl{display:inline-flex;align-items:center;gap:5px;color:var(--muted)}
+.import-ctl input{
+  width:56px;font:inherit;font-size:13px;color:var(--ink);
+  background:var(--surface);border:1px solid var(--line);
+  border-radius:6px;padding:3px 6px;text-align:right;
+}
+
 .viewport{
   flex:1;overflow:auto;
   display:flex;
@@ -434,6 +447,12 @@ footer{padding:12px 22px calc(12px + env(safe-area-inset-bottom));color:var(--mu
         <button class="btn small" id="undoBtn" type="button">↩ 撤销</button>
         <span class="edit-hint">点下方色卡或用量行选画笔 · 在图纸上点按/拖动上色<span class="hint-desktop"> · 右键擦除 · ⌘/Ctrl+Z 撤销</span><span class="hint-mobile"> · 用橡皮按钮擦除</span></span>
       </div>
+      <div class="import-bar" id="importBar" hidden>
+        <span id="importMsg"></span>
+        <span class="import-ctl">宽 <input type="number" id="impW" min="4" max="300"> × 高 <input type="number" id="impH" min="4" max="300"></span>
+        <button class="mini-btn" id="impApply" type="button">按此尺寸重新解析</button>
+        <button class="mini-btn" id="impDismiss" type="button">完成</button>
+      </div>
       <div class="viewport" id="viewport"><canvas id="board" hidden></canvas></div>
     </div>
 
@@ -515,6 +534,7 @@ for(const [id,p] of Object.entries(PALETTES)){
 const state = {
   img:null,
   gridW:48, gridH:0,
+  lockH:null,                 // 导入图纸时锁定高度（不按图片比例计算）
   dither:false, showGrid:true, showSym:false, ignoreAlpha:true,
   paletteId:"mard221",
   enabledByPalette:{},          // id -> Set(索引)
@@ -578,15 +598,10 @@ function loadFile(file){
     state.img = img; URL.revokeObjectURL(url); state.undoStack=[];
     if(pendingPatternImport){
       pendingPatternImport=false;
-      const ans=prompt("这张图纸横向是多少格（豆）？\n高度会按图片比例自动计算。", state.gridW);
-      if(ans!==null){
-        const w=Math.max(8,Math.min(200,parseInt(ans,10)||state.gridW));
-        $("dither").checked=false; state.dither=false;   // 图纸不需要抖动
-        setGridW(w);
-        toast("图纸已导入，用量核算见下方统计");
-        return;
-      }
+      importPattern(img);
+      return;
     }
+    state.lockH=null;
     rebuild(); toast("图片已加载");
   };
   img.onerror = ()=>{ toast("图片读取失败"); URL.revokeObjectURL(url); };
@@ -618,6 +633,7 @@ $("paletteSel").addEventListener("change",e=>{
 $("gridW").addEventListener("input",e=>setGridW(+e.target.value));
 function setGridW(w){
   state.gridW=w;
+  state.lockH=null;
   $("gridW").value=w;
   $("gridWOut").textContent=w;
   syncBoardChips();
@@ -932,7 +948,7 @@ function nearest(r,g,b){
 function rebuild(){
   if(!state.img) return;
   const img=state.img;
-  state.gridH=Math.max(4,Math.min(200,Math.round(state.gridW*img.naturalHeight/img.naturalWidth)));
+  state.gridH = state.lockH ?? Math.max(4,Math.min(200,Math.round(state.gridW*img.naturalHeight/img.naturalWidth)));
   const w=state.gridW,h=state.gridH;
 
   // 降采样
@@ -1196,6 +1212,220 @@ function download(dataUrl,name){
   const a=document.createElement("a");
   a.href=dataUrl; a.download=name; a.click();
 }
+
+/* ================= 图纸识别（导入核算） ================= */
+/* 思路参考专业图纸转换工具：边缘投影找网格线 → 周期校验/重建 →
+   格心区域中位采样（避开网格线和印刷符号）→ 同色聚类 → 匹配色板 */
+
+function median(arr){
+  const a=[...arr].sort((x,y)=>x-y);
+  const m=a.length>>1;
+  return a.length%2?a[m]:(a[m-1]+a[m])/2;
+}
+
+/* 从边缘强度曲线提取候选线位置 */
+function findLines(scores,len,otherLen){
+  // 真网格线贯穿整个图纸区域；格内符号的列/行投影远低于它
+  const thr=Math.max(otherLen*0.35,4);
+  const peaks=[];
+  for(let i=1;i<len-1;i++)
+    if(scores[i]>=thr&&scores[i]>=scores[i-1]&&scores[i]>=scores[i+1]) peaks.push(i);
+  if(scores[0]>=thr) peaks.unshift(0);          // 贴边的边框线
+  if(scores[len-1]>=thr) peaks.push(len-1);
+  // 邻近峰值分组取均值
+  const lines=[];
+  for(const p of peaks){
+    const last=lines[lines.length-1];
+    if(last&&p-last._end<=3){ last.sum+=p; last.n++; last._end=p; last.pos=last.sum/last.n; }
+    else lines.push({pos:p,sum:p,n:1,_end:p});
+  }
+  return lines.map(l=>l.pos);
+}
+
+/* 校验间距规则性；缺线时按中位周期重建 */
+function refineLines(lines){
+  if(lines.length<3) return null;
+  const first=lines[0], last=lines[lines.length-1];
+  const diffs=[];
+  for(let i=0;i<lines.length-1;i++) diffs.push(lines[i+1]-lines[i]);
+  const med=median(diffs);
+  if(med<3) return null;
+  const count=Math.round((last-first)/med);
+  if(count<2) return null;
+  const step=(last-first)/count;
+  const full=[];
+  for(let k=0;k<=count;k++) full.push(first+k*step);
+  // 支持度：每条重建线附近要有真实线
+  let support=0;
+  for(const p of full) if(lines.some(l=>Math.abs(l-p)<=step*0.35)) support++;
+  if(support/full.length<0.55) return null;
+  return {lines:full,step};
+}
+
+/* 自动检测网格，返回 {xLines,yLines} 或 null */
+function detectGridLines(img,W,H,d,g){
+  const colS=new Float32Array(W), rowS=new Float32Array(H);
+  for(let y=0;y<H;y++)for(let x=0;x<W-1;x++)
+    if(Math.abs(g[y*W+x+1]-g[y*W+x])>35) colS[x]++;
+  for(let y=0;y<H-1;y++)for(let x=0;x<W;x++)
+    if(Math.abs(g[(y+1)*W+x]-g[y*W+x])>35) rowS[y]++;
+  const xr=refineLines(findLines(colS,W,H));
+  const yr=refineLines(findLines(rowS,H,W));
+  if(!xr||!yr) return null;
+  // 横竖格宽应接近（允许 10% 误差）
+  if(Math.abs(xr.step-yr.step)/Math.max(xr.step,yr.step)>0.12) return null;
+  if(xr.lines.length-1<4||yr.lines.length-1<4) return null;
+  if(xr.lines.length-1>300||yr.lines.length-1>300) return null;
+  return {xLines:xr.lines,yLines:yr.lines};
+}
+
+/* 按格线采样每格中心区域的中位色 */
+function sampleCells(d,W,H,xLines,yLines){
+  const w=xLines.length-1, h=yLines.length-1;
+  const cells=new Array(w*h);
+  for(let j=0;j<h;j++){
+    const y0=yLines[j]+(yLines[j+1]-yLines[j])*0.28;
+    const y1=yLines[j]+(yLines[j+1]-yLines[j])*0.72;
+    for(let i=0;i<w;i++){
+      const x0=xLines[i]+(xLines[i+1]-xLines[i])*0.28;
+      const x1=xLines[i]+(xLines[i+1]-xLines[i])*0.72;
+      const sx=Math.max(1,Math.floor((x1-x0)/6)), sy=Math.max(1,Math.floor((y1-y0)/6));
+      const rs=[],gs=[],bs=[];
+      for(let y=Math.round(y0);y<y1;y+=sy)
+        for(let x=Math.round(x0);x<x1;x+=sx){
+          const o=(Math.min(H-1,y)*W+Math.min(W-1,x))*4;
+          rs.push(d[o]);gs.push(d[o+1]);bs.push(d[o+2]);
+        }
+      cells[j*w+i]=[median(rs),median(gs),median(bs)];
+    }
+  }
+  return cells;
+}
+
+/* 聚类（Lab 距离 ≤7 归一色）→ 匹配色板；空格判定 */
+function cellsToGrid(cells,w,h){
+  const labs=cells.map(c=>c?rgbToLab(c[0],c[1],c[2]):null);
+  // 空格：高亮度低彩度
+  const isEmpty=cells.map(c=>{
+    if(!c) return true;
+    const lum=0.2126*c[0]+0.7152*c[1]+0.0722*c[2];
+    const chroma=Math.max(...c)-Math.min(...c);
+    return lum>236&&chroma<16;
+  });
+  // 聚类
+  const repLab=[], repIdx=[];           // 簇代表
+  const clusterOf=new Int32Array(w*h).fill(-1);
+  for(let i=0;i<w*h;i++){
+    if(isEmpty[i]) continue;
+    let best=-1,bd=9;                   // 3²
+    for(let k=0;k<repLab.length;k++){
+      const L=repLab[k];
+      const dd=(labs[i][0]-L[0])**2+(labs[i][1]-L[1])**2+(labs[i][2]-L[2])**2;
+      if(dd<bd){bd=dd;best=k;}
+    }
+    if(best<0){ repLab.push(labs[i]); repIdx.push(i); clusterOf[i]=repLab.length-1; }
+    else clusterOf[i]=best;
+  }
+  // 每个簇匹配一次色板
+  const palMap=repLab.map(L=>{
+    let best=-1,bd=Infinity;
+    const pal=colors();
+    for(const pi of state.enabled){
+      const P=pal[pi].lab;
+      const dd=(L[0]-P[0])**2+(L[1]-P[1])**2+(L[2]-P[2])**2;
+      if(dd<bd){bd=dd;best=pi;}
+    }
+    return best;
+  });
+  const grid=new Int16Array(w*h).fill(-1);
+  for(let i=0;i<w*h;i++) if(clusterOf[i]>=0) grid[i]=palMap[clusterOf[i]];
+  // raw：用匹配后的色板颜色重建（原图对照模式直接显示解析结果）
+  const raw=new ImageData(w,h);
+  const pal=colors();
+  for(let i=0;i<w*h;i++){
+    const pi=grid[i];
+    if(pi<0){ raw.data[i*4+3]=0; continue; }
+    const c=pal[pi].rgb;
+    raw.data[i*4]=c[0]; raw.data[i*4+1]=c[1]; raw.data[i*4+2]=c[2]; raw.data[i*4+3]=255;
+  }
+  return {grid,raw,colors:repLab.length};
+}
+
+function drawAnalysisCanvas(img){
+  const MAX=1200;
+  const sc=Math.min(1,MAX/Math.max(img.naturalWidth,img.naturalHeight));
+  const W=Math.max(8,Math.round(img.naturalWidth*sc));
+  const H=Math.max(8,Math.round(img.naturalHeight*sc));
+  const cv=document.createElement("canvas"); cv.width=W; cv.height=H;
+  const cx=cv.getContext("2d");
+  cx.imageSmoothingEnabled=true; cx.imageSmoothingQuality="high";
+  cx.drawImage(img,0,0,W,H);
+  const d=cx.getImageData(0,0,W,H).data;
+  const g=new Float32Array(W*H);
+  for(let i=0;i<W*H;i++) g[i]=0.299*d[i*4]+0.587*d[i*4+1]+0.114*d[i*4+2];
+  return {d,g,W,H};
+}
+
+/* 自动识别解析 */
+function analyzePattern(img){
+  const {d,g,W,H}=drawAnalysisCanvas(img);
+  const det=detectGridLines(img,W,H,d,g);
+  if(!det) return null;
+  const w=det.xLines.length-1, h=det.yLines.length-1;
+  const cells=sampleCells(d,W,H,det.xLines,det.yLines);
+  const r=cellsToGrid(cells,w,h);
+  return {w,h,grid:r.grid,raw:r.raw,auto:true};
+}
+
+/* 手动尺寸解析：整图均分 + 格心采样 */
+function parseUniform(img,w,h){
+  const {d,g,W,H}=drawAnalysisCanvas(img);
+  const xLines=[],yLines=[];
+  for(let i=0;i<=w;i++) xLines.push(i*W/w);
+  for(let j=0;j<=h;j++) yLines.push(j*H/h);
+  const cells=sampleCells(d,W,H,xLines,yLines);
+  const r=cellsToGrid(cells,w,h);
+  return {w,h,grid:r.grid,raw:r.raw,auto:false};
+}
+
+let importImg=null;
+function applyParsedGrid(res,msg){
+  state.lockH=res.h;
+  state.gridW=res.w; state.gridH=res.h;
+  $("gridW").value=Math.min(150,res.w);
+  $("gridWOut").textContent=res.w;
+  syncBoardChips();
+  state.grid=res.grid; state.raw=res.raw;
+  state.undoStack=[]; state.active=null;
+  board.hidden=false;
+  $("exportPng").disabled=$("exportCsv").disabled=false;
+  $("editToggle").disabled=false;
+  $("impW").value=res.w; $("impH").value=res.h;
+  $("importBar").hidden=false;
+  $("importMsg").textContent=msg;
+  recomputeCounts(); render();
+  toast(msg);
+}
+function importPattern(img){
+  importImg=img;
+  $("dither").checked=false; state.dither=false;   // 图纸不需要抖动
+  const res=analyzePattern(img);
+  if(res){
+    applyParsedGrid(res,`✅ 已自动识别：${res.w} × ${res.h} 格。不准可在右侧改尺寸重新解析`);
+  }else{
+    const w=state.gridW;
+    const h=Math.max(4,Math.round(w*img.naturalHeight/img.naturalWidth));
+    const res2=parseUniform(img,w,h);
+    applyParsedGrid(res2,`⚠️ 没能识别出网格线，已按 ${w} × ${h} 格均分解析，请核对尺寸`);
+  }
+}
+$("impApply").addEventListener("click",()=>{
+  if(!importImg) return;
+  const w=Math.max(4,Math.min(300,parseInt($("impW").value,10)||0));
+  const h=Math.max(4,Math.min(300,parseInt($("impH").value,10)||0));
+  applyParsedGrid(parseUniform(importImg,w,h),`已按 ${w} × ${h} 格重新解析`);
+});
+$("impDismiss").addEventListener("click",()=>{ $("importBar").hidden=true; });
 
 /* ================= 初始化 ================= */
 state.enabled=getEnabledSet();
